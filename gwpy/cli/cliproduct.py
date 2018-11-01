@@ -31,6 +31,7 @@ import warnings
 import sys
 from collections import OrderedDict
 from functools import wraps
+import h5py
 
 from six import add_metaclass
 
@@ -176,17 +177,28 @@ class CliProduct(object):
         self.plot_num = 0
 
         #: start times for data sets
-        self.start_list = unique(
-            map(int, (gps for gpsl in args.start for gps in gpsl)))
+        if args.start:
+            self.start_list = unique(
+                map(int, (gps for gpsl in args.start for gps in gpsl)))
+        else:
+            self.start_list = None
 
         #: duration of each time segment
         self.duration = args.duration
 
         #: channels to load
-        self.chan_list = unique(c for clist in args.chan for c in clist)
+        # hdf input may delay this
+        if args.chan:
+            self.chan_list = unique(c for clist in args.chan for c in clist)
+        else:
+            self.chan_list = None
 
-        # total number of datasets that _should_ be acquired
-        self.n_datasets = len(self.chan_list) * len(self.start_list)
+            # total number of datasets that _should_ be acquired
+        # hdf input may delay this
+        if self.start_list and self.chan_list:
+            self.n_datasets = len(self.chan_list) * len(self.start_list)
+        else:
+            self.n_datasets = 0
 
         #: list of input data series (populated by get_data())
         self.timeseries = []
@@ -281,13 +293,14 @@ class CliProduct(object):
         """Add an `~argparse.ArgumentGroup` for channel options
         """
         group = parser.add_argument_group(
-            'Data options', 'What data to load')
-        group.add_argument('--chan', type=str, nargs='+', action='append',
-                           required=True, help='channels to load')
-        group.add_argument('--start', type=to_gps, nargs='+', action='append',
+            'Data options', 'What data to load. leave out for hdf5 to use'
+                            ' all data in file.')
+        group.add_argument('--chan', type=str, nargs='*', action='append',
+                           help='channels to load')
+        group.add_argument('--start', type=to_gps, nargs='*', action='append',
                            help='Starting GPS times (required)')
-        group.add_argument('--duration', type=to_s, default=10,
-                           help='Duration (seconds) [10]')
+        group.add_argument('--duration', type=to_s,
+                           help='Duration (seconds)')
         return group
 
     @classmethod
@@ -299,6 +312,8 @@ class CliProduct(object):
         meg = group.add_mutually_exclusive_group()
         meg.add_argument('-c', '--framecache', type=os.path.abspath,
                          help='read data from cache')
+        meg.add_argument('-H', '--hdf5', type=os.path.abspath,
+                         help='read all data from hdf5 file')
         meg.add_argument('-n', '--nds2-server', metavar='HOSTNAME',
                          help='name of nds2 server to use, default is to '
                          'try all of them')
@@ -420,6 +435,34 @@ class CliProduct(object):
     def _validate_arguments(self):
         """Sanity check arguments and raise errors if required
         """
+        # if input is hdf5 we might not have all things specified
+        if self.args.hdf5:
+            if not self.chan_list:
+                self.chan_list = list()
+            if not self.start_list:
+                self.start_list = list()
+            durations = list()
+            hobjs = list()
+
+            with h5py.File(self.args.hdf5) as hfile:
+                hfile.visit(hobjs.append)
+                for hobjkey in hobjs:
+                    hobj = hfile[hobjkey]
+                    if isinstance(hobj, h5py.Dataset):
+                        chan = hobj.attrs['channel']
+                        self.chan_list.append(chan)
+
+                        strt = hobj.attrs['x0']
+                        self.start_list.append(round(strt, 4))
+                        dur = hobj.size * hobj.attrs['dx']
+                        durations.append(int(dur))
+            # make those lists unique
+            self.chan_list = list(set(self.chan_list))
+            self.start_list = list(set(self.start_list))
+            self.duration = min(durations)
+            self.n_datasets = len(self.chan_list) * len(self.start_list)
+
+
         # validate number of data sets requested
         if len(self.chan_list) < self.MIN_CHANNELS:
             raise ValueError('this product requires at least {0} '
@@ -449,37 +492,67 @@ class CliProduct(object):
         args = self.args
 
         # determine how we're supposed get our data
-        source = 'cache' if args.framecache is not None else 'nds2'
+        if args.framecache:
+            source = 'cache'
+        elif args.hdf5:
+            source = 'hdf5'
+        else:
+            source = 'nds2'
 
-        # Get the data from NDS or Frames
-        for start in self.start_list:
-            end = start + self.duration
-            if source == 'nds2':
-                tsd = TimeSeriesDict.get(self.chan_list, start, end,
-                                         verbose=verb, host=args.nds2_server,
-                                         frametype=args.frametype)
-            else:
-                tsd = TimeSeriesDict.read(args.framecache, self.chan_list,
-                                          start=start, end=end)
+        if source == 'hdf5':
+            h5file = h5py.File(args.hdf5, 'r')
+            h5nodes = []
+            h5file.visit(h5nodes.append)
+            h5dsets = []
+            for node in h5nodes:
+                hobj = h5file[node]
+                if isinstance(hobj, h5py.Dataset):
+                    h5dsets.append(node)
 
-            for data in tsd.values():
-                if str(data.unit) in BAD_UNITS:
-                    data.override_unit('undef')
+            tsd = TimeSeriesDict.read(args.hdf5, h5dsets, format='hdf5')
+            self.preproc_timeseriesdict(tsd, args)
+            h5file.close()
 
-                data = self._filter_timeseries(
-                    data, highpass=args.highpass, lowpass=args.lowpass,
-                    notch=args.notch)
+        else:
+            # Get the data from NDS or Frames
+            for start in self.start_list:
+                end = start + self.duration
+                if source == 'nds2':
+                    tsd = TimeSeriesDict.get(self.chan_list, start, end,
+                                             verbose=verb,
+                                             host=args.nds2_server,
+                                             frametype=args.frametype)
+                else:
+                    tsd = TimeSeriesDict.read(args.framecache, self.chan_list,
+                                              start=start, end=end)
 
-                if data.dtype.kind == 'f':  # cast single to double
-                    data = data.astype('float64', order='A', copy=False)
-
-                self.timeseries.append(data)
+                self.preproc_timeseriesdict(tsd, args)
 
         # report what we have if they asked for it
         self.log(3, ('Channels: %s' % self.chan_list))
         self.log(3, ('Start times: %s, duration %s' % (
             self.start_list, self.duration)))
         self.log(3, ('Number of time series: %d' % len(self.timeseries)))
+
+    def preproc_timeseriesdict(self, tsd, args):
+        """After reading a timeseries there are a few operations we may want
+         to do. They are collected here."""
+        for data in tsd.values():
+            # There are some nonstandard units in the frame files that cause
+            # trouble, here we sent them to  something we can work with
+            if str(data.unit) in BAD_UNITS:
+                data.override_unit('undef')
+
+            if data.dtype.kind == 'f':  # cast single to double
+                data = data.astype('float64', order='A', copy=False)
+
+            #  Do any pre-filtering request
+            data = self._filter_timeseries(data, highpass=args.highpass,
+                                           lowpass=args.lowpass,
+                                           notch=args.notch)
+
+            #  when  all done save it in a list in the object for plotting
+            self.timeseries.append(data)
 
     @staticmethod
     def _filter_timeseries(data, highpass=None, lowpass=None, notch=None):
@@ -882,7 +955,8 @@ class TimeDomainProduct(CliProduct):
         return group
 
     def _finalize_arguments(self, args):
-        starts = [float(gps) for gpsl in args.start for gps in gpsl]
+        if args.start:      # hdf5 fets start & duration from file
+            starts = [float(gps) for gpsl in args.start for gps in gpsl]
         if args.xscale is None:  # set default x-axis scale
             args.xscale = 'auto-gps'
         if args.xmin is None:
